@@ -1,12 +1,5 @@
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/pci.h>
-#include <linux/msi.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-
+#include "i82580.h"
+#include "i82580_hw.h"
 
 char i82580_driver_name[] = "i82580";
 static char i82580_driver_string[] = "Intel(R) I340 Network Driver";
@@ -72,7 +65,62 @@ module_exit(i82580_exit_module);
 
 static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
+    struct net_device *netdev;
+    struct i82580_adapter *adapter = NULL;
+    int err, bars;
+
     pr_info("%s: vendor: 0x%04x, device: 0x%04x\n", i82580_driver_name, pdev->vendor, pdev->device);
+
+    /* Enable PCI DEVICE (MMIO only) */
+    bars = pci_select_bars(pdev, IORESOURCE_MEM);
+
+    err = pci_enable_device_mem(pdev);
+    if (err)
+            return err;
+
+    err = pci_request_selected_regions(pdev, bars, i82580_driver_name);
+    if (err)
+            goto err_disable_pci;
+    
+    pci_set_master(pdev);
+
+    /* DMA mask (82580 supports 64-bit DMA) */
+    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (err) {
+        dev_warn(&pdev->dev, "%s : falling back to 32-bit DMA\n", i82580_driver_name);
+        err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+        if (err)
+            goto err_release_regions;
+    }
+
+    /* allocate netdev with private adapter */
+    netdev = alloc_etherdev(sizeof(*adapter));
+    if (!netdev) {
+        err = -ENOMEM;
+        goto err_release_regions;
+    }
+
+    SET_NETDEV_DEV(netdev, &pdev->dev); // nedded to sysfs hierarchy
+    pci_set_drvdata(pdev, netdev);
+
+    adapter = netdev_priv(netdev);
+    memset(adapter, 0, sizeof(*adapter));
+
+    adapter->netdev = netdev;
+    adapter->pdev   = pdev;
+    spin_lock_init(&adapter->tx_lock);
+    spin_lock_init(&adapter->rx_lock);
+
+
+
+
+    /* map BAR0 MMIO */
+    adapter->hw_addr = pci_iomap(pdev, I82580_BAR_MMIO, 0);
+    if (!adapter->hw_addr) {
+        dev_err(&pdev->dev, i82580_driver_name, " : pci_iomap failed\n");
+        err = -ENODEV;
+        goto err_free_netdev_napi;
+    }
 
     return 0;
 }
