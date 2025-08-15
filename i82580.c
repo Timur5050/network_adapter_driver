@@ -24,7 +24,17 @@ static int i82580_open(struct net_device *ndev);
 static int i82580_setup_tx_ring(struct i82580_adapter *adap);
 static void i82580_tx_program_regs(struct i82580_adapter *adap, int q);
 static void i82580_tx_enable_mac(struct i82580_adapter *adap);
-static void i82580_tx_config_queue(struct i82580_adapter *adap, int q);
+static int i82580_tx_config_queue(struct i82580_adapter *adap, int q);
+void i82580_free_tx_ring(struct i82580_adapter *adap);
+static int i82580_setup_rx_ring(struct i82580_adapter *adap);
+static int i82580_alloc_all_rx_buffers(struct i82580_adapter *adap);
+static int i82580_alloc_rx_buffer(struct i82580_adapter *adap, int index);
+static void i82580_rx_program_regs(struct i82580_adapter *adap, int q);
+static int i82580_rx_config_queue(struct i82580_adapter *adap, int q);
+static void i82580_rx_enable_mac(struct i82580_adapter *adap);
+static void i82580_free_all_rx_buffers(struct i82580_adapter *adap);
+static void i82580_free_rx_ring(struct i82580_adapter *adap);
+
 
 
 static struct pci_driver i82580_driver = {
@@ -170,35 +180,52 @@ static int i82580_open(struct net_device *ndev)
     /* 4) Set on global TX (TCTL + TIPG) */
     i82580_tx_enable_mac(adapter);
 
-    /* allocate receive descriptors */
-    err = i82580_setup_all_rx_resources(adapter);
-    if (err)
-            goto err_setup_rx;
+    adapter->rx_ring = kzalloc(sizeof(*adapter->rx_ring), GFP_KERNEL);
+    if (!adapter->rx_ring)
+            return -ENOMEM;
     
-            
-    i82580_configure_hw(adapter);
-
-    err = request_irq(adapter->pdev->irq, mynic_isr, 0,
-        netdev->name, adapter);
-
-    if (err)
-        goto err_irq;
+    /* RX bring-up */
+    err = i82580_setup_rx_ring(adapter);
+    if (err) goto err_rx_setup;
     
-    napi_enable(&adapter->napi);
+    err = i82580_alloc_all_rx_buffers(adapter);
+    if (err) goto err_rx_bufs;
+    
+    i82580_rx_program_regs(adapter, 0);
+    
+    err = i82580_rx_config_queue(adapter, 0);
+    if (err) goto err_rx_cfg;
 
-    mynic_irq_enable(adapter);
+    i82580_rx_enable_mac(adapter);
 
-    netif_start_queue(netdev);
+    // i82580_configure_hw(adapter);
 
-    mynic_trigger_link_check(adapter);
+    // err = request_irq(adapter->pdev->irq, mynic_isr, 0,
+    //     netdev->name, adapter);
+
+    // if (err)
+    //     goto err_irq;
+    
+    // napi_enable(&adapter->napi);
+
+    // mynic_irq_enable(adapter);
+
+    // netif_start_queue(netdev);
+
+    // mynic_trigger_link_check(adapter);
 
     return 0;
 
-err_irq:
-    mynic_free_rx(adapter);
-err_rx:
-    mynic_free_tx(adapter);
+err_rx_cfg:
+    i82580_free_all_rx_buffers(adapter);
+err_rx_bufs:
+    i82580_free_rx_ring(adapter);
+err_rx_setup:
+    kfree(adapter->rx_ring);
 err_tx:
+    i82580_free_tx_ring(adapter);
+    kfree(adapter->tx_ring);
+    pci_disable_device(adapter->pdev);
     return err;
 }
 
@@ -291,13 +318,13 @@ static int i82580_tx_config_queue(struct i82580_adapter *adap, int q)
 
     /* wait while bit Enable is not 1 (not more 1ms) */
     for (int i = 0; i < 1000; i++) {
-        if (readl(hw + I82580_TXDCTL(q) & TXDCTL_QUEUE_ENABLE))
+        if (readl(hw + I82580_TXDCTL(q)) & TXDCTL_QUEUE_ENABLE)
             return 0;
         udelay(1);
     }
 
     /* if we are here - queue is not enabled */
-    dev_err(adap->netdev->dev.parent, "TX queue &d enable failed\n", q);
+    dev_err(adap->netdev->dev.parent, "TX queue %d enable failed\n", q);
 
     /* rollback - disable bit */
     txdctl &= ~TXDCTL_QUEUE_ENABLE;
@@ -306,8 +333,240 @@ static int i82580_tx_config_queue(struct i82580_adapter *adap, int q)
     return -ETIMEDOUT;
 }
 
+void i82580_free_tx_ring(struct i82580_adapter *adap)
+{
+    struct i82580_ring *tx = adap->tx_ring;
+    struct pci_dev *pdev = adap->pdev;
+
+    if (!tx)
+        return;
+
+    /* Яtx->skbs[], tx->buf_dma[] + free */
+
+    if (tx->desc) {
+        dma_free_coherent(&pdev->dev,
+                          tx->size,
+                          tx->desc,
+                          tx->dma);
+        tx->desc = NULL;
+    }
+}
+
+static int i82580_setup_rx_ring(struct i82580_adapter *adap)
+{
+    struct i82580_ring *rx = adap->tx_ring;
+    struct pci_dev *pdev = adap->pdev;
+
+    rx->count   = 256;
+    rx->size    = rx->count * sizeof(struct i82580_adv_rx_desc);
+
+    rx->desc    = dma_alloc_coherent(&pdev->dev, rx->size, &rx->dma, GFP_KERNEL);
+    if (!rx->desc)
+            return -ENOMEM;
+
+    rx->next_to_use     = 0;
+    rx->next_to_clean   = 0;
+    memset(rx->desc, 0, rx->size);
+
+    /* for buffers' book-keeping */
+    rx->skbs = kcalloc(rx->count, sizeof(*rx->skbs), GFP_KERNEL);
+    if (!rx->skbs)
+        goto err_free_ring;
+
+    rx->buf_dma = kcalloc(rx->count, sizeof(*rx->buf_dma), GFP_KERNEL);
+        goto err_free_skbs;
+
+    return 0;
+
+err_free_skbs:
+    kfree(rx->skbs);
+    rx->skbs = NULL;
+err_free_ring:
+    dma_free_coherent(&pdev->dev, rx->size, rx->desc, rx->dma);
+    rx->desc = NULL;
+    return -ENOMEM;
+}
+
+static int i82580_alloc_all_rx_buffers(struct i82580_adapter *adap)
+{
+    int i, err;
+
+    for (i = 0; i < adap->rx_ring->count; i++) {
+        err = i82580_alloc_rx_buffer(adap, i);
+        if (err)
+            goto err_partial;
+    }
+
+    return 0;
+
+err_partial:
+    while (--i >= 0) {
+        if (adap->rx_ring->skbs[i]) {
+            dma_unmap_single(&adap->pdev->dev, 
+                            adap->rx_ring->buf_dma[i],
+                            I82580_RX_BUF_LEN, DMA_FROM_DEVICE);
+            dev_kfree_skb_any(adap->rx_ring->skbs[i]);
+            adap->rx_ring->skbs[i] = NULL;
+        }
+    }
+    return -ENOMEM;
+}
+
+static int i82580_alloc_rx_buffer(struct i82580_adapter *adap, int index)
+{
+    struct i82580_ring *rx = adap->rx_ring;
+    struct i82580_adv_rx_desc *desc;
+    struct sk_buff *skb;
+    dma_addr_t dma;
+
+    skb = netdev_alloc_skb_ip_align(adap->netdev, I82580_RX_BUF_LEN);
+    if (!skb)
+            return -ENOMEM;
+
+    dma = dma_map_single(&adap->pdev->dev, skb->data,
+                        I82580_RX_BUF_LEN, DMA_FROM_DEVICE);
+    if (dma_mapping_error(&adap->pdev->dev, dma)) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
+
+    desc = (struct i82580_adv_rx_desc *)rx->desc + index;
+    desc->pkt_addr = cpu_to_le64(dma);
+    desc->hdr_addr = 0; /* for no header split */ 
+
+    rx->skbs[index] = skb;
+    rx->buf_dma[index] = dma;
+
+    return 0;
+}
+
+/* setting rx registers */
+void i82580_rx_program_regs(struct i82580_adapter *adap, int q)
+{
+    struct i82580_ring *rx = &adap->rx_ring[q];
+    void __iomem *hw = adap->hw_addr;
+    u32 lo = lower_32_bits(rx->dma);
+    u32 hi = upper_32_bits(rx->dma);
+    u32 srrctl;
+
+    /* base and length of ring */
+    writel(lo, hw + I82580_RDBAL(q));
+    writel(hi, hw + I82580_RDBAH(q));
+    writel(rx->size, hw + I82580_RDLEN(q));
+
+   /* SRRCTL: descriptor's type + size of packet buffer 
+   * one-buffer advandec RX desc
+   */
+   srrctl = readl(hw + I82580_SRRCTL(q));
+   srrctl &= ~(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
+
+   srrctl |= ((I82580_RX_BUF_LEN >> SRRCTL_BSIZEPKT_SHIFT) << SRRCTL_BSIZEPKT_SHIFT);
+   srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
+
+   writel(srrctl, hw + I82580_SRRCTL(q));
+
+   /* start head/tail. default RDH=0. RDT=count-1,
+   * that means "all N descriptors are available for NIC"
+   */
+  writel(0,             hw + I82580_RDH(q));
+  writel(rx->count -1,  hw + I82580_RDT(q));
+}
+
+/* rx prep and enable, poll for ready*/
+static int i82580_rx_config_queue(struct i82580_adapter *adap, int q)
+{
+    void __iomem *hw = adap->hw_addr;
+    u32 rxdctl;
+    int i;
+
+    rxdctl  = readl(hw + I82580_RXDCTL(q));
+    rxdctl &= ~(RXDCTL_PTHRESH_MASK | RXDCTL_HTHRESH_MASK | RXDCTL_WTHRESH_MASK);
+    rxdctl |= FIELD_PREP(RXDCTL_PTHRESH_MASK, RXDCTL_PTHRESH_DEFAULT);
+    rxdctl |= FIELD_PREP(RXDCTL_HTHRESH_MASK, RXDCTL_HTHRESH_DEFAULT);
+    rxdctl |= FIELD_PREP(RXDCTL_WTHRESH_MASK, RXDCTL_WTHRESH_DEFAULT);
+    rxdctl |= RXDCTL_QUEUE_ENABLE;
+
+    writel(rxdctl, hw + I82580_RXDCTL(q));
+
+    /* polling: waiting for nic get enable */
+    for(i = 0; i < 1000; i++) {
+        if (readl(hw + I82580_RXDCTL(q)) & RXDCTL_QUEUE_ENABLE)
+            return 0;
+        udelay(1);
+    }
+
+    /* rollback */
+    rxdctl &= ~RXDCTL_QUEUE_ENABLE;
+    writel(rxdctl, hw + I82580_RXDCTL(q));
+    dev_err(&adap->pdev->dev, "RX queue %d failed to enable\n", q);
+    return -ETIMEDOUT;
+}
+
+/* global enabling rx controller */
+static void i82580_rx_enable_mac(struct i82580_adapter *adap)
+{
+    void __iomem *hw = adap->hw_addr;
+    u32 rctl;
+
+    rctl = readl(hw + I82580_RCTL);
+    rctl &= ~I82580_RCTL_EN;
+    writel(rctl, hw + I82580_RCTL);
+    udelay(1);
+
+    rctl &= ~I82580_RCTL_BSIZE_MASK;
+    rctl |= I82580_RCTL_BSIZE_2048; 
+
+    // Multicast offset
+    rctl &= ~I82580_RCTL_MO_MASK;
+    rctl |= I82580_RCTL_MO_0;
+
+    // Broadcast Accept Mode + Strip CRC
+    rctl |= I82580_RCTL_BAM;
+    rctl |= I82580_RCTL_SECRC;
+
+    rctl |= I82580_RCTL_EN;
+
+    writel(rctl, hw + I82580_RCTL);
+
+    pr_info("RX MAC enabled\n");
+}
 
 
+static void i82580_free_all_rx_buffers(struct i82580_adapter *adap)
+{
+    struct i82580_ring *rx = adap->rx_ring;
+    int i;
 
+    if (!rx || !rx->skbs)
+            return;
 
+    for (i = 0; i < rx->count; i++) {
+        if (rx->skbs[i]) {
+            dma_unmap_single(&adap->pdev->dev, rx->buf_dma[i], 
+                            I82580_RX_BUF_LEN, DMA_FROM_DEVICE);
+            dev_kfree_skb_any(rx->skbs[i]);
+            rx->skbs[i] = NULL;
+        }
+    }
+}
 
+static void i82580_free_rx_ring(struct i82580_adapter *adap)
+{
+    struct i82580_ring *rx = adap->rx_ring;
+    struct pci_dev *pdev = adap->pdev;
+
+    if (!rx) return;
+
+    i82580_free_all_rx_buffers(adap);
+
+    kfree(rx->buf_dma);
+    rx->buf_dma = NULL;
+    
+    kfree(rx->skbs);
+    rx->skbs = NULL;
+
+    if (rx->desc) {
+        dma_free_coherent(&pdev->dev, rx->size, rx->desc, rx->dma);
+        rx->desc = NULL;
+    }
+}
