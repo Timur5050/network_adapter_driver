@@ -34,6 +34,11 @@ struct i82580_ring {
     dma_addr_t      *buf_dma;       // dma of mapped sk_buffs
 };
 
+struct i82580_stats {
+    u64 rx_packets;
+    u64 rx_errors;
+    u64 tx_packets;
+};
 
 struct i82580_adapter {
 
@@ -61,6 +66,9 @@ struct i82580_adapter {
 
     /* flags & debug */
     unsigned long flags;
+
+    /* stats */
+    struct i82580_stats stats;
 };
 
 #endif /* _I82580_H_ */
