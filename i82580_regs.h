@@ -12,6 +12,8 @@
 #define I82580_TDH(q)     (0xE010 + (q) * 0x40)
 #define I82580_TDT(q)     (0xE018 + (q) * 0x40)
 
+#define TX_WAKE_THRESHOLD 32
+
 /* -------------------- Transmit Control (TCTL) -------------------- */
 #define I82580_TCTL       0x0400
 #define I82580_TCTL_EN    (1 << 1)     /* Enable transmitter */
@@ -99,5 +101,25 @@
 
 /* RX Buffer Length */
 #define I82580_RX_BUF_LEN    1522
+
+/* Interrupt registers (from your datasheet) */
+#define I82580_ICR       0x1500  /* Interrupt Cause Read (RC/W1C) */
+#define I82580_ICS       0x1504  /* Interrupt Cause Set (WO) */
+#define I82580_IMS       0x1508  /* Interrupt Mask Set/Read */
+#define I82580_IMC       0x150C  /* Interrupt Mask Clear */
+
+/* ICR bits (from datasheet excerpt you pasted) */
+#define I82580_ICR_TXDW      (1U << 0)   /* Transmit Descriptor Written Back */
+#define I82580_ICR_LSC       (1U << 2)   /* Link Status Change */
+#define I82580_ICR_RXDMT0    (1U << 4)   /* Receive Descriptor Minimum Threshold Reached */
+#define I82580_ICR_RXMISS    (1U << 6)   /* Rx Missed packet (overflow) */
+#define I82580_ICR_RXDW      (1U << 7)   /* Receiver Descriptor Write Back */
+#define I82580_ICR_SWMB      (1U << 8)   /* SW mailbox write */
+#define I82580_ICR_GPHY      (1U << 10)  /* PHY interrupt */
+
+/* Useful masks for our driver */
+#define I82580_ICR_RX_MASK   (I82580_ICR_RXDW | I82580_ICR_RXDMT0 | I82580_ICR_RXMISS)
+#define I82580_ICR_TX_MASK   (I82580_ICR_TXDW)
+#define I82580_ICR_MISC_MASK (I82580_ICR_LSC | I82580_ICR_GPHY)
 
 #endif /* _I82580_REGS_H_ */
