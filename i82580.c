@@ -1,5 +1,6 @@
 #include "i82580.h"
 #include "i82580_hw.h"
+#include "i82580_regs.h"
 
 char i82580_driver_name[] = "i82580";
 static char i82580_driver_string[] = "Intel(R) I340 Network Driver";
@@ -19,6 +20,11 @@ static int i82580_init_module(void);
 static void i82580_exit_module(void);
 static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent);
 static void i82580_remove(struct pci_dev *pdev);
+static int i82580_open(struct net_device *ndev);
+static int i82580_setup_tx_ring(struct i82580_adapter *adap);
+static void i82580_tx_program_regs(struct i82580_adapter *adap, int q);
+static void i82580_tx_enable_mac(struct i82580_adapter *adap);
+static void i82580_tx_config_queue(struct i82580_adapter *adap, int q);
 
 
 static struct pci_driver i82580_driver = {
@@ -62,6 +68,12 @@ static void __exit i82580_exit_module(void)
 }
 
 module_exit(i82580_exit_module);
+
+
+static const struct net_device_ops i82580_netdev_ops = {
+    .ndo_open   = i82580_open,
+};
+
 
 static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
@@ -129,4 +141,173 @@ static void i82580_remove(struct pci_dev *pdev)
 {
     pr_info("%s : success if romoving\n", i82580_driver_name);
 }
+
+static int i82580_open(struct net_device *ndev)
+{
+    struct i82580_adapter *adapter  = netdev_priv(ndev);
+    int err;
+
+    if (test_bit(I82580_TESTING, &adapter->flags))
+            return -EBUSY;
+
+    netif_carrier_off(ndev);
+
+    adapter->tx_ring = kzalloc(sizeof(*adapter->tx_ring), GFP_KERNEL);
+    if (!adapter->tx_ring)
+            return -ENOMEM;
+
+    /* allocate transmit descriptors */
+    err = i82580_setup_tx_ring(adapter);    // dma_alloc_coherent + init indices
+    if (err)
+        goto err_tx;
+    
+    /* 2) set registers of all params for queue 0 */
+    i82580_tx_program_regs(adapter, 0);
+    
+    /* 3) set registers of behaviour for queue 0 */
+    i82580_tx_config_queue(adapter, 0);
+    
+    /* 4) Set on global TX (TCTL + TIPG) */
+    i82580_tx_enable_mac(adapter);
+
+    /* allocate receive descriptors */
+    err = i82580_setup_all_rx_resources(adapter);
+    if (err)
+            goto err_setup_rx;
+    
+            
+    i82580_configure_hw(adapter);
+
+    err = request_irq(adapter->pdev->irq, mynic_isr, 0,
+        netdev->name, adapter);
+
+    if (err)
+        goto err_irq;
+    
+    napi_enable(&adapter->napi);
+
+    mynic_irq_enable(adapter);
+
+    netif_start_queue(netdev);
+
+    mynic_trigger_link_check(adapter);
+
+    return 0;
+
+err_irq:
+    mynic_free_rx(adapter);
+err_rx:
+    mynic_free_tx(adapter);
+err_tx:
+    return err;
+}
+
+
+static int i82580_setup_tx_ring(struct i82580_adapter *adap)
+{
+    struct i82580_ring *tx = adap->tx_ring;
+    struct pci_dev *pdev = adap->pdev;
+
+    tx->count = 256;
+
+    tx->size  = tx->count * sizeof(struct i82580_adv_tx_desc);
+
+    tx->desc = dma_alloc_coherent(&pdev->dev,
+                                  tx->size,
+                                  &tx->dma,
+                                  GFP_KERNEL);
+    if (!tx->desc)
+            return -ENOMEM;
+
+    if (WARN_ON_ONCE(tx->dma & (128 - 1)))
+            pr_warn("tx dma not 128B aligned (driver/pool bug)\n");
+
+    tx->next_to_use = 0;
+    tx->next_to_clean = 0;
+
+    memset(tx->desc, 0, tx->size);
+
+    return 0;
+}
+
+
+static void i82580_tx_program_regs(struct i82580_adapter *adap, int q)
+{
+    struct i82580_ring *tx = &adap->tx_ring[q];
+    void __iomem *hw = adap->hw_addr;
+    u32 lo = lower_32_bits(tx->dma);
+    u32 hi = upper_32_bits(tx->dma);
+
+    writel(lo, hw + I82580_TDBAL(q));
+    writel(hi, hw + I82580_TDBAH(q));
+
+    writel(tx->size, hw + I82580_TDLEN(q));
+
+    writel(0, hw + I82580_TDH(q));
+    writel(0, hw + I82580_TDT(q));
+}
+
+
+static void i82580_tx_enable_mac(struct i82580_adapter *adap)
+{
+    void __iomem *hw = adap->hw_addr;
+    u32 tctl, tipg;
+
+    tctl = readl(hw + I82580_TCTL);
+    tctl |= I82580_TCTL_EN | I82580_TCTL_PSP;
+
+    tctl &= ~I82580_TCTL_CT_MASK;
+    tctl |= (I82580_TCTL_CT_DEFAULT << I82580_TCTL_CT_SHIFT);
+
+    tctl &= ~I82580_TCTL_BST_MASK;
+    tctl |= (I82580_TCTL_BST_DEFAULT << I82580_TCTL_BST_SHIFT);
+
+    writel(tctl, hw + I82580_TCTL);
+
+    tipg = I82580_TIPG_DEFAULT;
+    writel(tipg, hw + I82580_TIPG);
+}
+
+static int i82580_tx_config_queue(struct i82580_adapter *adap, int q)
+{
+    void __iomem *hw = adap->hw_addr;
+    u32 txdctl = readl(hw + I82580_TXDCTL(q));
+
+    /* clean up old values */
+    txdctl &= ~(TXDCTL_PTHRESH_MASK |
+        TXDCTL_HTHRESH_MASK |
+        TXDCTL_WTHRESH_MASK);
+
+    /* set recommended  preps from datasheet */
+    txdctl |= FIELD_PREP(TXDCTL_PTHRESH_MASK, TXDCTL_PTHRESH_DEFAULT);
+    txdctl |= FIELD_PREP(TXDCTL_HTHRESH_MASK, TXDCTL_HTHRESH_DEFAULT);
+    txdctl |= FIELD_PREP(TXDCTL_WTHRESH_MASK, TXDCTL_WTHRESH_DEFAULT);
+
+    /* enable queue */
+    txdctl |= TXDCTL_QUEUE_ENABLE;
+
+    /* write back to the register */
+    writel(txdctl, hw + I82580_TXDCTL(q));
+
+    /* wait while bit Enable is not 1 (not more 1ms) */
+    for (int i = 0; i < 1000; i++) {
+        if (readl(hw + I82580_TXDCTL(q) & TXDCTL_QUEUE_ENABLE))
+            return 0;
+        udelay(1);
+    }
+
+    /* if we are here - queue is not enabled */
+    dev_err(adap->netdev->dev.parent, "TX queue &d enable failed\n", q);
+
+    /* rollback - disable bit */
+    txdctl &= ~TXDCTL_QUEUE_ENABLE;
+    writel(txdctl, hw + I82580_TXDCTL(q));
+
+    return -ETIMEDOUT;
+}
+
+
+
+
+
 
