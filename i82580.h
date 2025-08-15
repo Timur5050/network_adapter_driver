@@ -16,6 +16,11 @@ struct i82580_adapter;
 
 #define I82580_BAR_MMIO 0
 
+enum {
+    I82580_TESTING = 0,
+    I82580_DOWN,
+};
+
 struct i82580_ring {
     void *desc;                     // list if descriptors ( DMA )
     dma_addr_t dma;                 // DMA-address for device
@@ -50,6 +55,9 @@ struct i82580_adapter {
     /* interrupts */
     struct msix_entry *msix_entries;
     int num_vectors;
+
+    /* flags & debug */
+    unsigned long flags;
 };
 
 #endif /* _I82580_H_ */
