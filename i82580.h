@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/bitfield.h>
 
 struct i82580_adapter;
 
@@ -25,10 +26,12 @@ struct i82580_ring {
     void *desc;                     // list if descriptors ( DMA )
     dma_addr_t dma;                 // DMA-address for device
     unsigned int count;             // amount of descriptors in ring
+    unsigned int size;              // size of ring
     unsigned int next_to_use;       // index of next entry to use
     unsigned int next_to_clean;     // index of next entry to clean
 
-    struct sk_buff **skbs;          // connected sk_buff for each descriptor
+    struct sk_buff  **skbs;         // connected sk_buff for each descriptor
+    dma_addr_t      *buf_dma;       // dma of mapped sk_buffs
 };
 
 
