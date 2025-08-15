@@ -25,6 +25,7 @@ static int i82580_setup_tx_ring(struct i82580_adapter *adap);
 static void i82580_tx_program_regs(struct i82580_adapter *adap, int q);
 static void i82580_tx_enable_mac(struct i82580_adapter *adap);
 static int i82580_tx_config_queue(struct i82580_adapter *adap, int q);
+void i82580_free_all_tx_buffers(struct i82580_adapter *adap);
 void i82580_free_tx_ring(struct i82580_adapter *adap);
 static int i82580_setup_rx_ring(struct i82580_adapter *adap);
 static int i82580_alloc_all_rx_buffers(struct i82580_adapter *adap);
@@ -34,6 +35,11 @@ static int i82580_rx_config_queue(struct i82580_adapter *adap, int q);
 static void i82580_rx_enable_mac(struct i82580_adapter *adap);
 static void i82580_free_all_rx_buffers(struct i82580_adapter *adap);
 static void i82580_free_rx_ring(struct i82580_adapter *adap);
+static irqreturn_t i82580_isr(int irq, void *dev_id);
+static int i82580_poll(struct napi_struct *napi, int budget);
+void i82580_clean_tx(struct i82580_adapter *adap);
+static netdev_tx_t i82580_xmit_frame(struct sk_buff *skb, struct net_device *netdev);
+static int i82580_close(struct net_device *ndev);
 
 
 
@@ -81,7 +87,9 @@ module_exit(i82580_exit_module);
 
 
 static const struct net_device_ops i82580_netdev_ops = {
-    .ndo_open   = i82580_open,
+    .ndo_open = i82580_open,
+    .ndo_start_xmit = i82580_xmit_frame,
+    .ndo_stop = i82580_close
 };
 
 
@@ -134,8 +142,6 @@ static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
     spin_lock_init(&adapter->rx_lock);
 
 
-
-
     /* map BAR0 MMIO */
     adapter->hw_addr = pci_iomap(pdev, I82580_BAR_MMIO, 0);
     if (!adapter->hw_addr) {
@@ -144,7 +150,22 @@ static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
         goto err_free_netdev_napi;
     }
 
+    netdev->netdev_ops = &i82580_netdev_ops;
+
+    err = register_netdev(netdev);
+    if (err)
+        goto err_free_iomap;
+
     return 0;
+
+err_free_iomap:
+err_free_netdev_napi:
+    free_netdev(netdev);
+err_release_regions:
+    pci_release_regions(pdev);
+err_disable_pci:
+    pci_disable_device(pdev);
+    return err;
 }
 
 static void i82580_remove(struct pci_dev *pdev)
@@ -154,78 +175,72 @@ static void i82580_remove(struct pci_dev *pdev)
 
 static int i82580_open(struct net_device *ndev)
 {
-    struct i82580_adapter *adapter  = netdev_priv(ndev);
+    struct i82580_adapter *adapter = netdev_priv(ndev);
     int err;
 
     if (test_bit(I82580_TESTING, &adapter->flags))
-            return -EBUSY;
+        return -EBUSY;
 
     netif_carrier_off(ndev);
 
     adapter->tx_ring = kzalloc(sizeof(*adapter->tx_ring), GFP_KERNEL);
     if (!adapter->tx_ring)
-            return -ENOMEM;
+        return -ENOMEM;
 
-    /* allocate transmit descriptors */
-    err = i82580_setup_tx_ring(adapter);    // dma_alloc_coherent + init indices
+    err = i82580_setup_tx_ring(adapter);
     if (err)
         goto err_tx;
-    
-    /* 2) set registers of all params for queue 0 */
+
     i82580_tx_program_regs(adapter, 0);
-    
-    /* 3) set registers of behaviour for queue 0 */
     i82580_tx_config_queue(adapter, 0);
-    
-    /* 4) Set on global TX (TCTL + TIPG) */
     i82580_tx_enable_mac(adapter);
 
     adapter->rx_ring = kzalloc(sizeof(*adapter->rx_ring), GFP_KERNEL);
     if (!adapter->rx_ring)
-            return -ENOMEM;
-    
-    /* RX bring-up */
+        goto err_rx;
+
     err = i82580_setup_rx_ring(adapter);
-    if (err) goto err_rx_setup;
-    
+    if (err)
+        goto err_rx_setup;
+
     err = i82580_alloc_all_rx_buffers(adapter);
-    if (err) goto err_rx_bufs;
-    
+    if (err)
+        goto err_rx_bufs;
+
     i82580_rx_program_regs(adapter, 0);
-    
     err = i82580_rx_config_queue(adapter, 0);
-    if (err) goto err_rx_cfg;
+    if (err)
+        goto err_rx_cfg;
 
     i82580_rx_enable_mac(adapter);
 
-    // i82580_configure_hw(adapter);
+    writel(I82580_ICR_RX_MASK | I82580_ICR_TX_MASK | I82580_ICR_MISC_MASK,
+           adapter->hw_addr + I82580_IMS);
 
-    // err = request_irq(adapter->pdev->irq, mynic_isr, 0,
-    //     netdev->name, adapter);
+    netif_napi_add(ndev, &adapter->napi, i82580_poll);
+    napi_enable(&adapter->napi);
 
-    // if (err)
-    //     goto err_irq;
-    
-    // napi_enable(&adapter->napi);
+    err = request_irq(adapter->pdev->irq, i82580_isr, 0, ndev->name, adapter);
+    if (err)
+        goto err_irq;
 
-    // mynic_irq_enable(adapter);
-
-    // netif_start_queue(netdev);
-
-    // mynic_trigger_link_check(adapter);
+    netif_start_queue(ndev);
 
     return 0;
 
+err_irq:
+    napi_disable(&adapter->napi);
+    netif_napi_del(&adapter->napi);
 err_rx_cfg:
     i82580_free_all_rx_buffers(adapter);
 err_rx_bufs:
     i82580_free_rx_ring(adapter);
 err_rx_setup:
     kfree(adapter->rx_ring);
-err_tx:
+err_rx:
     i82580_free_tx_ring(adapter);
+err_tx:
     kfree(adapter->tx_ring);
-    pci_disable_device(adapter->pdev);
     return err;
 }
 
@@ -254,7 +269,20 @@ static int i82580_setup_tx_ring(struct i82580_adapter *adap)
 
     memset(tx->desc, 0, tx->size);
 
-    return 0;
+    tx->skbs = kcalloc(tx->count, sizeof(*tx->skbs), GFP_KERNEL);
+    if (!tx->skbs)
+        goto err_free_ring;
+
+    tx->buf_dma = kcalloc(tx->count, sizeof(*tx->buf_dma), GFP_KERNEL);
+        goto err_free_skbs;
+
+err_free_skbs:
+    kfree(tx->skbs);
+    tx->skbs = NULL;
+err_free_ring:
+    dma_free_coherent(&pdev->dev, tx->size, tx->desc, tx->dma);
+    tx->desc = NULL;
+    return -ENOMEM;
 }
 
 
@@ -333,6 +361,25 @@ static int i82580_tx_config_queue(struct i82580_adapter *adap, int q)
     return -ETIMEDOUT;
 }
 
+void i82580_free_all_tx_buffers(struct i82580_adapter *adap)
+{
+    struct i82580_ring *tx = adap->tx_ring;
+    int i;
+
+    if (!tx || !tx->skbs)
+        return;
+
+    for (i = 0; i < tx->count; i++) {
+        if (tx->skbs[i]) {
+            dma_unmap_single(&adap->pdev->dev, tx->buf_dma[i],
+                             I82580_RX_BUF_LEN, DMA_TO_DEVICE);
+            dev_kfree_skb_any(tx->skbs[i]);
+            tx->skbs[i] = NULL;
+            tx->buf_dma[i] = 0;
+        }
+    }
+}
+
 void i82580_free_tx_ring(struct i82580_adapter *adap)
 {
     struct i82580_ring *tx = adap->tx_ring;
@@ -341,20 +388,23 @@ void i82580_free_tx_ring(struct i82580_adapter *adap)
     if (!tx)
         return;
 
-    /* Яtx->skbs[], tx->buf_dma[] + free */
+    i82580_free_all_tx_buffers(adap);
+
+    kfree(tx->buf_dma);
+    tx->buf_dma = NULL;
+
+    kfree(tx->skbs);
+    tx->skbs = NULL;
 
     if (tx->desc) {
-        dma_free_coherent(&pdev->dev,
-                          tx->size,
-                          tx->desc,
-                          tx->dma);
+        dma_free_coherent(&pdev->dev, tx->size, tx->desc, tx->dma);
         tx->desc = NULL;
     }
 }
 
 static int i82580_setup_rx_ring(struct i82580_adapter *adap)
 {
-    struct i82580_ring *rx = adap->tx_ring;
+    struct i82580_ring *rx = adap->rx_ring;
     struct pci_dev *pdev = adap->pdev;
 
     rx->count   = 256;
@@ -569,4 +619,255 @@ static void i82580_free_rx_ring(struct i82580_adapter *adap)
         dma_free_coherent(&pdev->dev, rx->size, rx->desc, rx->dma);
         rx->desc = NULL;
     }
+}
+
+static irqreturn_t i82580_isr(int irq, void *dev_id)
+{
+    struct i82580_adapter *adap = dev_id;
+    void __iomem *hw = adap->hw_addr;
+    u32 icr, handled;
+
+    /* Read cause. ICR is RC/W1C: reading gives pending causes. */
+    icr = readl(hw + I82580_ICR);
+    if (!icr)
+        return IRQ_NONE; /* not our interrupt */
+
+    /* Clear only handled bits */
+    handled = icr & (I82580_ICR_RX_MASK | I82580_ICR_TX_MASK | I82580_ICR_MISC_MASK);
+    writel(handled, hw + I82580_ICR);
+
+    /* Log unhandled bits for debug */
+    if (icr & ~handled)
+        netdev_warn(adap->netdev, "Unhandled ICR bits: 0x%x\n", icr & ~handled);
+
+    /* RX events: schedule NAPI to handle bulk receive */
+    if (icr & I82580_ICR_RX_MASK) {
+        writel(I82580_ICR_RX_MASK, hw + I82580_IMC); /* mask RX bits */
+        napi_schedule(&adap->napi);
+    }
+
+    /* TX done: clean completed TX descriptors (free skbs) */
+    if (icr & I82580_ICR_TX_MASK) {
+        i82580_clean_tx(adap);
+    }
+
+    /* Link status change */
+    if (icr & I82580_ICR_LSC) {
+        netdev_info(adap->netdev, "Link status change\n");
+        /* TODO: call i82580_check_link(adap); */
+    }
+
+    /* other events: GPHY, RXMISS, errors — log or handle */
+    if (icr & I82580_ICR_RXMISS) {
+        netdev_warn(adap->netdev, "RX buffer overflow (RXMISS)\n");
+    }
+
+    return IRQ_HANDLED;
+}
+
+static int i82580_poll(struct napi_struct *napi, int budget)
+{
+    struct i82580_adapter *adap = container_of(napi, struct i82580_adapter, napi);
+    struct i82580_ring *rx = adap->rx_ring;
+    void __iomem *hw = adap->hw_addr;
+    int work_done = 0;
+    int i = rx->next_to_clean;
+
+    while (work_done < budget) {
+        struct i82580_adv_rx_desc *rxd;
+        u16 pkt_len;
+        u8 status, errors;
+        struct sk_buff *skb;
+        dma_addr_t dma;
+
+        rxd = (struct i82580_adv_rx_desc *)rx->desc + i;
+
+        dma_rmb();
+
+        status = rxd->upper.wb.status;
+        errors = rxd->upper.wb.errors;
+        if (!(status & 0x01))
+            break;
+
+        if (errors) {
+            adap->stats.rx_errors++;
+            if (rx->skbs[i]) {
+                dev_kfree_skb_any(rx->skbs[i]);
+                rx->skbs[i] = NULL;
+                rx->buf_dma[i] = 0;
+            }
+            goto rx_refill;
+        }
+
+        pkt_len = le16_to_cpu(rxd->lower.lengths.length);
+        dma = (dma_addr_t)le64_to_cpu(rxd->pkt_addr);
+
+        skb = rx->skbs[i];
+        if (!skb) {
+            netdev_err(adap->netdev, "rx: missing skb at idx %d\n", i);
+            adap->stats.rx_errors++;
+            goto rx_refill;
+        }
+
+        dma_unmap_single(&adap->pdev->dev, rx->buf_dma[i], I82580_RX_BUF_LEN, DMA_FROM_DEVICE);
+
+        skb_put(skb, pkt_len);
+        skb->protocol = eth_type_trans(skb, adap->netdev);
+        skb_checksum_none_assert(skb);
+
+        napi_gro_receive(napi, skb);
+        adap->stats.rx_packets++;
+
+        rx->skbs[i] = NULL;
+        rx->buf_dma[i] = 0;
+
+        work_done++;
+
+rx_refill:
+        {
+            struct sk_buff *new_skb = netdev_alloc_skb_ip_align(adap->netdev, I82580_RX_BUF_LEN);
+            dma_addr_t new_dma;
+
+            if (!new_skb) {
+                netdev_warn(adap->netdev, "rx: skb alloc fail at idx %d\n", i);
+                adap->stats.rx_errors++;
+            } else {
+                new_dma = dma_map_single(&adap->pdev->dev, new_skb->data,
+                                         I82580_RX_BUF_LEN, DMA_FROM_DEVICE);
+                if (dma_mapping_error(&adap->pdev->dev, new_dma)) {
+                    dev_kfree_skb_any(new_skb);
+                    netdev_err(adap->netdev, "rx: dma_map failed\n");
+                    adap->stats.rx_errors++;
+                } else {
+                    rxd->pkt_addr = cpu_to_le64(new_dma);
+                    rxd->hdr_addr = 0;
+                    dma_wmb();
+                    rx->skbs[i] = new_skb;
+                    rx->buf_dma[i] = new_dma;
+                    rx->next_to_use = (i + 1) % rx->count;
+                }
+            }
+        }
+
+        i++;
+        if (i >= rx->count)
+            i = 0;
+    }
+
+    rx->next_to_clean = i;
+
+    writel((rx->next_to_use ? rx->next_to_use - 1 : rx->count - 1),
+           hw + I82580_RDT(0));
+
+    if (work_done < budget) {
+        napi_complete_done(napi, work_done);
+        writel(I82580_ICR_RX_MASK, hw + I82580_IMS);
+    }
+
+    return work_done;
+}
+
+static unsigned int i82580_desc_unused(struct i82580_ring *tx)
+{
+    return (tx->count + tx->next_to_clean - tx->next_to_use - 1) % tx->count;
+}
+
+void i82580_clean_tx(struct i82580_adapter *adap)
+{
+    struct i82580_ring *tx = adap->tx_ring;
+    unsigned int ntc = tx->next_to_clean;
+    unsigned int ntu = tx->next_to_use;
+    unsigned int count = tx->count;
+
+    while (ntc != ntu) {
+        struct i82580_adv_tx_desc *txd = (struct i82580_adv_tx_desc *)tx->desc + ntc;
+        u8 status = txd->upper.wb.status;
+
+        /* Check DD bit */
+        if (!(status & 0x01))
+            break;
+
+        /* descriptor done: free associated skb and unmap dma */
+        if (tx->skbs && tx->skbs[ntc]) {
+            struct sk_buff *skb = tx->skbs[ntc];
+            dma_unmap_single(&adap->pdev->dev, tx->buf_dma[ntc], skb->len, DMA_TO_DEVICE);
+            dev_kfree_skb_any(skb);
+            tx->skbs[ntc] = NULL;
+            tx->buf_dma[ntc] = 0;
+        }
+
+        ntc++;
+        if (ntc >= count)
+            ntc = 0;
+    }
+
+    tx->next_to_clean = ntc;
+
+    if (netif_queue_stopped(adap->netdev) && i82580_desc_unused(tx) >= TX_WAKE_THRESHOLD) {
+        netif_wake_queue(adap->netdev);
+    }
+}
+
+static netdev_tx_t i82580_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+{
+    struct i82580_adapter *adap = netdev_priv(netdev);
+    struct i82580_ring *tx = adap->tx_ring;
+    struct i82580_adv_tx_desc *txd;
+    dma_addr_t dma;
+    unsigned int i;
+
+    /* Check if enough descriptors are available */
+    if (i82580_desc_unused(tx) < 2) {
+        netif_stop_queue(netdev);
+        return NETDEV_TX_BUSY;
+    }
+
+    i = tx->next_to_use;
+    txd = (struct i82580_adv_tx_desc *)tx->desc + i;
+
+    /* Map skb to DMA */
+    dma = dma_map_single(&adap->pdev->dev, skb->data, skb->len, DMA_TO_DEVICE);
+    if (dma_mapping_error(&adap->pdev->dev, dma)) {
+        dev_kfree_skb_any(skb);
+        adap->stats.rx_errors++;
+        return NETDEV_TX_OK; /* Drop packet */
+    }
+
+    /* Fill descriptor */
+    txd->buffer_addr = cpu_to_le64(dma);
+    txd->lower.flags.length = cpu_to_le16(skb->len);
+    txd->lower.flags.cmd = 0x03 | 0x08; /* EOP | IFCS | RS */
+    txd->lower.flags.cso = 0;
+    txd->upper.wb.status = 0;
+
+    /* Store for cleanup */
+    tx->skbs[i] = skb;
+    tx->buf_dma[i] = dma;
+
+    /* Advance next_to_use */
+    tx->next_to_use = (i + 1) % tx->count;
+
+    /* Publish to NIC */
+    dma_wmb();
+    writel(tx->next_to_use, adap->hw_addr + I82580_TDT(0));
+
+    adap->stats.tx_packets++;
+
+    return NETDEV_TX_OK;
+}
+
+
+static int i82580_close(struct net_device *ndev)
+{
+    struct i82580_adapter *adapter = netdev_priv(ndev);
+    netif_stop_queue(ndev);
+    napi_disable(&adapter->napi);
+    netif_napi_del(&adapter->napi);
+    free_irq(adapter->pdev->irq, adapter);
+    i82580_free_all_rx_buffers(adapter);
+    i82580_free_rx_ring(adapter);
+    i82580_free_tx_ring(adapter);
+    kfree(adapter->rx_ring);
+    kfree(adapter->tx_ring);
+    return 0;
 }
