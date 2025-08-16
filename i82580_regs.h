@@ -1,6 +1,10 @@
 #ifndef _I82580_REGS_H_
 #define _I82580_REGS_H_
 
+/* Receive Address Registers */
+#define I82580_RAL(n)           (0x5400 + (8 * (n))) /* Receive Address Low, n=0..15 */
+#define I82580_RAH(n)           (0x5404 + (8 * (n))) /* Receive Address High, n=0..15 */
+
 /* TX Descriptor Base Address Low/High */
 #define I82580_TDBAL(q)   (0xE000 + (q) * 0x40)  
 #define I82580_TDBAH(q)   (0xE004 + (q) * 0x40)
