@@ -40,6 +40,7 @@ static int i82580_poll(struct napi_struct *napi, int budget);
 void i82580_clean_tx(struct i82580_adapter *adap);
 static netdev_tx_t i82580_xmit_frame(struct sk_buff *skb, struct net_device *netdev);
 static int i82580_close(struct net_device *ndev);
+static void i82580_read_mac_addr(struct i82580_adapter *adap);
 
 
 
@@ -150,6 +151,8 @@ static int i82580_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
         goto err_free_netdev_napi;
     }
 
+    i82580_read_mac_addr(adapter);
+
     netdev->netdev_ops = &i82580_netdev_ops;
 
     err = register_netdev(netdev);
@@ -170,7 +173,21 @@ err_disable_pci:
 
 static void i82580_remove(struct pci_dev *pdev)
 {
-    pr_info("%s : success if romoving\n", i82580_driver_name);
+    struct net_device *netdev = pci_get_drvdata(pdev);
+    struct i82580_adapter *adap;
+
+    if (!netdev)
+        return;
+
+    adap = netdev_priv(netdev);
+
+    unregister_netdev(netdev);
+    free_netdev(netdev);
+    if (adap->hw_addr)
+        pci_iounmap(pdev, adap->hw_addr);
+
+    pci_release_selected_regions(pdev, pci_select_bars(pdev, IORESOURCE_MEM));
+    pci_disable_device(pdev);
 }
 
 static int i82580_open(struct net_device *ndev)
@@ -870,4 +887,45 @@ static int i82580_close(struct net_device *ndev)
     kfree(adapter->rx_ring);
     kfree(adapter->tx_ring);
     return 0;
+}
+
+
+static void i82580_read_mac_addr(struct i82580_adapter *adap)
+{
+    void __iomem *hw = adap->hw_addr;
+    u32 ral, rah;
+    const u8 *mac_addr = adap->netdev->dev_addr;
+
+    /* Read MAC address from RAH/RAL registers (Receive Address 0) */
+    ral = readl(hw + I82580_RAL(0));
+    rah = readl(hw + I82580_RAH(0));
+
+    /* Check Address Valid bit (AV) in RAH */
+    if (!(rah & BIT(31))) {
+        dev_warn(&adap->pdev->dev, "MAC address not valid, using random\n");
+        eth_hw_addr_random(adap->netdev);
+        return;
+    }
+
+    /* Since dev_addr is const, we can't modify it directly.
+     * Instead, verify the MAC address and log it.
+     */
+    u8 temp_mac[ETH_ALEN];
+    temp_mac[0] = (u8)(ral & 0xFF);
+    temp_mac[1] = (u8)((ral >> 8) & 0xFF);
+    temp_mac[2] = (u8)((ral >> 16) & 0xFF);
+    temp_mac[3] = (u8)((ral >> 24) & 0xFF);
+    temp_mac[4] = (u8)(rah & 0xFF);
+    temp_mac[5] = (u8)((rah >> 8) & 0xFF);
+
+    /* Compare with netdev->dev_addr */
+    if (memcmp(mac_addr, temp_mac, ETH_ALEN) != 0) {
+        dev_warn(&adap->pdev->dev, "MAC address mismatch, using random\n");
+        eth_hw_addr_random(adap->netdev);
+    } else if (!is_valid_ether_addr(mac_addr)) {
+        dev_warn(&adap->pdev->dev, "Invalid MAC address, using random\n");
+        eth_hw_addr_random(adap->netdev);
+    } else {
+        dev_info(&adap->pdev->dev, "MAC address: %pM\n", mac_addr);
+    }
 }
