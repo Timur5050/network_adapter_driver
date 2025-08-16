@@ -61,7 +61,7 @@ struct i82580_adapter {
     void __iomem *hw_addr;
 
     /* interrupts */
-    struct msix_entry *msix_entries;
+    struct msix_entry *msix_entries; // for future
     int num_vectors;
 
     /* flags & debug */
