@@ -12,6 +12,9 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/bitfield.h>
+#include <linux/mii.h>
+#include <linux/ethtool.h>
+#include <linux/dma-mapping.h>
 
 struct i82580_adapter;
 
@@ -38,6 +41,8 @@ struct i82580_stats {
     u64 rx_packets;
     u64 rx_errors;
     u64 tx_packets;
+    u64 tx_bytes;
+    u64 tx_errors;
 };
 
 struct i82580_adapter {
